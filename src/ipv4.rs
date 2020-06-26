@@ -1,8 +1,5 @@
-use std::fmt;
-use std::net::Ipv4Addr;
-use std::str::FromStr;
-
-use common::{cidr_parts, parse_addr, parse_prefix, IpNetworkError};
+use crate::common::{cidr_parts, parse_prefix, IpNetworkError};
+use std::{fmt, net::Ipv4Addr, str::FromStr};
 
 const IPV4_BITS: u8 = 32;
 
@@ -13,38 +10,89 @@ pub struct Ipv4Network {
     prefix: u8,
 }
 
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for Ipv4Network {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = <String>::deserialize(deserializer)?;
+        Ipv4Network::from_str(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for Ipv4Network {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
 impl Ipv4Network {
     /// Constructs a new `Ipv4Network` from any `Ipv4Addr` and a prefix denoting the network size.
+    ///
     /// If the prefix is larger than 32 this will return an `IpNetworkError::InvalidPrefix`.
     pub fn new(addr: Ipv4Addr, prefix: u8) -> Result<Ipv4Network, IpNetworkError> {
         if prefix > IPV4_BITS {
             Err(IpNetworkError::InvalidPrefix)
         } else {
-            Ok(Ipv4Network {
-                addr: addr,
-                prefix: prefix,
-            })
+            Ok(Ipv4Network { addr, prefix })
         }
+    }
+
+    /// Constructs a new `Ipv4Network` from a network address and a network mask.
+    ///
+    /// If the netmask is not valid this will return an `IpNetworkError::InvalidPrefix`.
+    pub fn with_netmask(
+        netaddr: Ipv4Addr,
+        netmask: Ipv4Addr,
+    ) -> Result<Ipv4Network, IpNetworkError> {
+        let prefix = ipv4_mask_to_prefix(netmask)?;
+        let net = Self {
+            addr: netaddr,
+            prefix,
+        };
+        Ok(net)
     }
 
     /// Returns an iterator over `Ipv4Network`. Each call to `next` will return the next
     /// `Ipv4Addr` in the given network. `None` will be returned when there are no more
     /// addresses.
-    pub fn iter(&self) -> Ipv4NetworkIterator {
-        let start = u64::from(u32::from(self.network()));
-        let end = start + self.size();
+    pub fn iter(self) -> Ipv4NetworkIterator {
+        let start = u32::from(self.network());
+        let end = start + (self.size() - 1);
         Ipv4NetworkIterator {
-            next: start,
-            end: end,
+            next: Some(start),
+            end,
         }
     }
 
-    pub fn ip(&self) -> Ipv4Addr {
+    pub fn ip(self) -> Ipv4Addr {
         self.addr
     }
 
-    pub fn prefix(&self) -> u8 {
+    pub fn prefix(self) -> u8 {
         self.prefix
+    }
+
+    /// Checks if the given `Ipv4Network` is a subnet of the other.
+    pub fn is_subnet_of(self, other: Ipv4Network) -> bool {
+        other.ip() <= self.ip() && other.broadcast() >= self.broadcast()
+    }
+
+    /// Checks if the given `Ipv4Network` is a supernet of the other.
+    pub fn is_supernet_of(self, other: Ipv4Network) -> bool {
+        other.is_subnet_of(self)
+    }
+
+    /// Checks if the given `Ipv4Network` is partly contained in other.
+    pub fn overlaps(self, other: Ipv4Network) -> bool {
+        other.contains(self.ip())
+            || (other.contains(self.broadcast())
+                || (self.contains(other.ip()) || (self.contains(other.broadcast()))))
     }
 
     /// Returns the mask for this `Ipv4Network`.
@@ -56,10 +104,12 @@ impl Ipv4Network {
     /// use std::net::Ipv4Addr;
     /// use ipnetwork::Ipv4Network;
     ///
+    /// let net: Ipv4Network = "127.0.0.0".parse().unwrap();
+    /// assert_eq!(net.mask(), Ipv4Addr::new(255, 255, 255, 255));
     /// let net: Ipv4Network = "127.0.0.0/16".parse().unwrap();
     /// assert_eq!(net.mask(), Ipv4Addr::new(255, 255, 0, 0));
     /// ```
-    pub fn mask(&self) -> Ipv4Addr {
+    pub fn mask(self) -> Ipv4Addr {
         let prefix = self.prefix;
         let mask = !(0xffff_ffff as u64 >> prefix) as u32;
         Ipv4Addr::from(mask)
@@ -77,7 +127,7 @@ impl Ipv4Network {
     /// let net: Ipv4Network = "10.1.9.32/16".parse().unwrap();
     /// assert_eq!(net.network(), Ipv4Addr::new(10, 1, 0, 0));
     /// ```
-    pub fn network(&self) -> Ipv4Addr {
+    pub fn network(self) -> Ipv4Addr {
         let mask = u32::from(self.mask());
         let ip = u32::from(self.addr) & mask;
         Ipv4Addr::from(ip)
@@ -95,7 +145,7 @@ impl Ipv4Network {
     /// let net: Ipv4Network = "10.9.0.32/16".parse().unwrap();
     /// assert_eq!(net.broadcast(), Ipv4Addr::new(10, 9, 255, 255));
     /// ```
-    pub fn broadcast(&self) -> Ipv4Addr {
+    pub fn broadcast(self) -> Ipv4Addr {
         let mask = u32::from(self.mask());
         let broadcast = u32::from(self.addr) | !mask;
         Ipv4Addr::from(broadcast)
@@ -113,9 +163,9 @@ impl Ipv4Network {
     /// assert!(net.contains(Ipv4Addr::new(127, 0, 0, 70)));
     /// assert!(!net.contains(Ipv4Addr::new(127, 0, 1, 70)));
     /// ```
-    pub fn contains(&self, ip: Ipv4Addr) -> bool {
-        let net = u32::from(self.network());
-        let mask = u32::from(self.mask());
+    pub fn contains(self, ip: Ipv4Addr) -> bool {
+        let mask = !(0xffff_ffff as u64 >> self.prefix) as u32;
+        let net = u32::from(self.addr) & mask;
         (u32::from(ip) & mask) == net
     }
 
@@ -133,9 +183,9 @@ impl Ipv4Network {
     /// let tinynet: Ipv4Network = "0.0.0.0/32".parse().unwrap();
     /// assert_eq!(tinynet.size(), 1);
     /// ```
-    pub fn size(&self) -> u64 {
+    pub fn size(self) -> u32 {
         let host_bits = u32::from(IPV4_BITS - self.prefix);
-        (2 as u64).pow(host_bits)
+        (2 as u32).pow(host_bits)
     }
 
     /// Returns the `n`:th address within this network.
@@ -155,8 +205,8 @@ impl Ipv4Network {
     /// let net2: Ipv4Network = "10.0.0.0/16".parse().unwrap();
     /// assert_eq!(net2.nth(256).unwrap(), Ipv4Addr::new(10, 0, 1, 0));
     /// ```
-    pub fn nth(&self, n: u32) -> Option<Ipv4Addr> {
-        if u64::from(n) < self.size() {
+    pub fn nth(self, n: u32) -> Option<Ipv4Addr> {
+        if n < self.size() {
             let net = u32::from(self.network());
             Some(Ipv4Addr::from(net + n))
         } else {
@@ -166,7 +216,7 @@ impl Ipv4Network {
 }
 
 impl fmt::Display for Ipv4Network {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(fmt, "{}/{}", self.ip(), self.prefix())
     }
 }
@@ -188,8 +238,18 @@ impl FromStr for Ipv4Network {
     type Err = IpNetworkError;
     fn from_str(s: &str) -> Result<Ipv4Network, IpNetworkError> {
         let (addr_str, prefix_str) = cidr_parts(s)?;
-        let addr = parse_addr(addr_str)?;
-        let prefix = parse_prefix(prefix_str, IPV4_BITS)?;
+        let addr = Ipv4Addr::from_str(addr_str)
+            .map_err(|_| IpNetworkError::InvalidAddr(addr_str.to_string()))?;
+        let prefix = match prefix_str {
+            Some(v) => {
+                if let Ok(netmask) = Ipv4Addr::from_str(v) {
+                    ipv4_mask_to_prefix(netmask)?
+                } else {
+                    parse_prefix(v, IPV4_BITS)?
+                }
+            }
+            None => IPV4_BITS,
+        };
         Ipv4Network::new(addr, prefix)
     }
 }
@@ -203,32 +263,42 @@ impl From<Ipv4Addr> for Ipv4Network {
     }
 }
 
+#[derive(Copy, Clone, Debug)]
 pub struct Ipv4NetworkIterator {
-    next: u64,
-    end: u64,
+    next: Option<u32>,
+    end: u32,
 }
 
 impl Iterator for Ipv4NetworkIterator {
     type Item = Ipv4Addr;
 
     fn next(&mut self) -> Option<Ipv4Addr> {
-        if self.next < self.end {
-            let next = Ipv4Addr::from(self.next as u32);
-            self.next += 1;
-            Some(next)
-        } else {
+        let next = self.next?;
+        self.next = if next == self.end {
             None
-        }
+        } else {
+            Some(next + 1)
+        };
+        Some(next.into())
+    }
+}
+
+impl IntoIterator for &'_ Ipv4Network {
+    type IntoIter = Ipv4NetworkIterator;
+    type Item = Ipv4Addr;
+    fn into_iter(self) -> Ipv4NetworkIterator {
+        self.iter()
     }
 }
 
 /// Converts a `Ipv4Addr` network mask into a prefix.
+///
 /// If the mask is invalid this will return an `IpNetworkError::InvalidPrefix`.
 pub fn ipv4_mask_to_prefix(mask: Ipv4Addr) -> Result<u8, IpNetworkError> {
     let mask = u32::from(mask);
 
     let prefix = (!mask).leading_zeros() as u8;
-    if ((mask as u64) << prefix) & 0xffff_ffff != 0 {
+    if (u64::from(mask) << prefix) & 0xffff_ffff != 0 {
         Err(IpNetworkError::InvalidPrefix)
     } else {
         Ok(prefix)
@@ -237,10 +307,10 @@ pub fn ipv4_mask_to_prefix(mask: Ipv4Addr) -> Result<u8, IpNetworkError> {
 
 #[cfg(test)]
 mod test {
-    use std::mem;
-    use std::collections::HashMap;
-    use std::net::Ipv4Addr;
     use super::*;
+    use std::collections::HashMap;
+    use std::mem;
+    use std::net::Ipv4Addr;
 
     #[test]
     fn create_v4() {
@@ -255,13 +325,6 @@ mod test {
     }
 
     #[test]
-    fn parse_v4_0bit() {
-        let cidr: Ipv4Network = "0/0".parse().unwrap();
-        assert_eq!(cidr.ip(), Ipv4Addr::new(0, 0, 0, 0));
-        assert_eq!(cidr.prefix(), 0);
-    }
-
-    #[test]
     fn parse_v4_24bit() {
         let cidr: Ipv4Network = "127.1.0.0/24".parse().unwrap();
         assert_eq!(cidr.ip(), Ipv4Addr::new(127, 1, 0, 0));
@@ -271,6 +334,13 @@ mod test {
     #[test]
     fn parse_v4_32bit() {
         let cidr: Ipv4Network = "127.0.0.0/32".parse().unwrap();
+        assert_eq!(cidr.ip(), Ipv4Addr::new(127, 0, 0, 0));
+        assert_eq!(cidr.prefix(), 32);
+    }
+
+    #[test]
+    fn parse_v4_noprefix() {
+        let cidr: Ipv4Network = "127.0.0.0".parse().unwrap();
         assert_eq!(cidr.ip(), Ipv4Addr::new(127, 0, 0, 0));
         assert_eq!(cidr.prefix(), 32);
     }
@@ -310,30 +380,6 @@ mod test {
     fn parse_v4_fail_two_slashes() {
         let cidr: Option<Ipv4Network> = "10.1.1.1/24/".parse().ok();
         assert_eq!(None, cidr);
-    }
-
-    #[test]
-    fn size_v4_24bit() {
-        let net: Ipv4Network = "0/24".parse().unwrap();
-        assert_eq!(net.size(), 256);
-    }
-
-    #[test]
-    fn size_v4_1bit() {
-        let net: Ipv4Network = "0/31".parse().unwrap();
-        assert_eq!(net.size(), 2);
-    }
-
-    #[test]
-    fn size_v4_max() {
-        let net: Ipv4Network = "0/0".parse().unwrap();
-        assert_eq!(net.size(), 4_294_967_296);
-    }
-
-    #[test]
-    fn size_v4_min() {
-        let net: Ipv4Network = "0/32".parse().unwrap();
-        assert_eq!(net.size(), 1);
     }
 
     #[test]
@@ -412,14 +458,6 @@ mod test {
         assert_eq!(None, iter.next());
     }
 
-    #[test]
-    fn iterator_v4_tiny() {
-        let cidr: Ipv4Network = "10/32".parse().unwrap();
-        let mut iter = cidr.iter();
-        assert_eq!(Ipv4Addr::new(10, 0, 0, 0), iter.next().unwrap());
-        assert_eq!(None, iter.next());
-    }
-
     // Tests the entire IPv4 space to see if the iterator will stop at the correct place
     // and not overflow or wrap around. Ignored since it takes a long time to run.
     #[test]
@@ -440,11 +478,45 @@ mod test {
         assert_eq!(prefix, 25);
     }
 
+    /// Parse netmask as well as prefix
+    #[test]
+    fn parse_netmask() {
+        let from_netmask: Ipv4Network = "192.168.1.0/255.255.255.0".parse().unwrap();
+        let from_prefix: Ipv4Network = "192.168.1.0/24".parse().unwrap();
+        assert_eq!(from_netmask, from_prefix);
+    }
+
+    #[test]
+    fn parse_netmask_broken_v4() {
+        assert_eq!(
+            "192.168.1.0/255.0.255.0".parse::<Ipv4Network>(),
+            Err(IpNetworkError::InvalidPrefix)
+        );
+    }
+
     #[test]
     fn invalid_v4_mask_to_prefix() {
         let mask = Ipv4Addr::new(255, 0, 255, 0);
         let prefix = ipv4_mask_to_prefix(mask);
         assert!(prefix.is_err());
+    }
+
+    #[test]
+    fn ipv4network_with_netmask() {
+        {
+            // Positive test-case.
+            let addr = Ipv4Addr::new(127, 0, 0, 1);
+            let mask = Ipv4Addr::new(255, 0, 0, 0);
+            let net = Ipv4Network::with_netmask(addr, mask).unwrap();
+            let expected = Ipv4Network::new(Ipv4Addr::new(127, 0, 0, 1), 8).unwrap();
+            assert_eq!(net, expected);
+        }
+        {
+            // Negative test-case.
+            let addr = Ipv4Addr::new(127, 0, 0, 1);
+            let mask = Ipv4Addr::new(255, 0, 255, 0);
+            Ipv4Network::with_netmask(addr, mask).unwrap_err();
+        }
     }
 
     #[test]
@@ -464,5 +536,126 @@ mod test {
     fn test_sync() {
         fn assert_sync<T: Sync>() {}
         assert_sync::<Ipv4Network>();
+    }
+
+    // Tests from cpython https://github.com/python/cpython/blob/e9bc4172d18db9c182d8e04dd7b033097a994c06/Lib/test/test_ipaddress.py
+    #[test]
+    fn test_is_subnet_of() {
+        let mut test_cases: HashMap<(Ipv4Network, Ipv4Network), bool> = HashMap::new();
+
+        test_cases.insert(
+            (
+                "10.0.0.0/30".parse().unwrap(),
+                "10.0.1.0/24".parse().unwrap(),
+            ),
+            false,
+        );
+        test_cases.insert(
+            (
+                "10.0.0.0/30".parse().unwrap(),
+                "10.0.0.0/24".parse().unwrap(),
+            ),
+            true,
+        );
+        test_cases.insert(
+            (
+                "10.0.0.0/30".parse().unwrap(),
+                "10.0.1.0/24".parse().unwrap(),
+            ),
+            false,
+        );
+        test_cases.insert(
+            (
+                "10.0.1.0/24".parse().unwrap(),
+                "10.0.0.0/30".parse().unwrap(),
+            ),
+            false,
+        );
+
+        for (key, val) in test_cases.iter() {
+            let (src, dest) = (key.0, key.1);
+            assert_eq!(
+                src.is_subnet_of(dest),
+                *val,
+                "testing with {} and {}",
+                src,
+                dest
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_supernet_of() {
+        let mut test_cases: HashMap<(Ipv4Network, Ipv4Network), bool> = HashMap::new();
+
+        test_cases.insert(
+            (
+                "10.0.0.0/30".parse().unwrap(),
+                "10.0.1.0/24".parse().unwrap(),
+            ),
+            false,
+        );
+        test_cases.insert(
+            (
+                "10.0.0.0/30".parse().unwrap(),
+                "10.0.0.0/24".parse().unwrap(),
+            ),
+            false,
+        );
+        test_cases.insert(
+            (
+                "10.0.0.0/30".parse().unwrap(),
+                "10.0.1.0/24".parse().unwrap(),
+            ),
+            false,
+        );
+        test_cases.insert(
+            (
+                "10.0.0.0/24".parse().unwrap(),
+                "10.0.0.0/30".parse().unwrap(),
+            ),
+            true,
+        );
+
+        for (key, val) in test_cases.iter() {
+            let (src, dest) = (key.0, key.1);
+            assert_eq!(
+                src.is_supernet_of(dest),
+                *val,
+                "testing with {} and {}",
+                src,
+                dest
+            );
+        }
+    }
+
+    #[test]
+    fn test_overlaps() {
+        let other: Ipv4Network = "1.2.3.0/30".parse().unwrap();
+        let other2: Ipv4Network = "1.2.2.0/24".parse().unwrap();
+        let other3: Ipv4Network = "1.2.2.64/26".parse().unwrap();
+
+        let skynet: Ipv4Network = "1.2.3.0/24".parse().unwrap();
+        assert_eq!(skynet.overlaps(other), true);
+        assert_eq!(skynet.overlaps(other2), false);
+        assert_eq!(other2.overlaps(other3), true);
+    }
+
+    #[test]
+    fn edges() {
+        let low: Ipv4Network = "0.0.0.0/24".parse().unwrap();
+        let low_addrs: Vec<Ipv4Addr> = low.iter().collect();
+        assert_eq!(256, low_addrs.len());
+        assert_eq!("0.0.0.0".parse::<Ipv4Addr>().unwrap(), low_addrs[0]);
+        assert_eq!("0.0.0.255".parse::<Ipv4Addr>().unwrap(), low_addrs[255]);
+
+        let high: Ipv4Network = "255.255.255.0/24".parse().unwrap();
+        let high_addrs: Vec<Ipv4Addr> = high.iter().collect();
+        assert_eq!(256, high_addrs.len());
+        assert_eq!("255.255.255.0".parse::<Ipv4Addr>().unwrap(), high_addrs[0]);
+        assert_eq!(
+            "255.255.255.255".parse::<Ipv4Addr>().unwrap(),
+            high_addrs[255]
+        );
     }
 }

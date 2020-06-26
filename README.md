@@ -1,14 +1,14 @@
 ipnetwork
 ===
-This is a library to work with IPv4 and v6 CIDRs in rust
-The IPv4 implementation is stable, IPv6 implementation is not done yet.
+This is a library to work with IPv4 and IPv6 CIDRs in Rust
 
 [![Build Status](https://travis-ci.org/achanda/ipnetwork.svg?branch=master)](https://travis-ci.org/achanda/ipnetwork)
 [![Merit Badge](http://meritbadge.herokuapp.com/ipnetwork)](https://crates.io/crates/ipnetwork)
 
 Run Clippy by doing
 ```
-cargo test --features "dev"
+rustup component add clippy
+cargo clippy
 ```
 
 ### Installation
@@ -20,7 +20,7 @@ cargo test
 ```
 
 You can also add `ipnetwork` as a dependency to your project's `Cargo.toml`:
-```
+```toml
 [dependencies]
 ipnetwork = "*"
 ```
